@@ -1,3 +1,12 @@
+## 0.4.0
+
+- While the driver is online or busy, the engine now re-sends the last known fix,
+  marked `isHeartbeat`, whenever nothing has been sent for a whole
+  `heartbeatInterval`. A phone whose GPS stops producing fixes (indoors,
+  stationary, OS throttling) therefore keeps reaching the backend for as long as
+  its network is up, instead of silently dropping out of dispatch while the app
+  shows Online. Nothing is sent before the first fix or after going offline.
+
 ## 0.3.0
 
 - Worked on improvements for `deviation_detector.dart` and `route_snapper.dart` 

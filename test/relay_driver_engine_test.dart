@@ -816,4 +816,95 @@ void main() {
       await locationCtrl.close();
     });
   });
+
+  group('RelayDriverEngine — idle heartbeat while GPS is silent', () {
+    // Short intervals so the test runs in real time; the ratios match production
+    // (heartbeat 25 s > normal > fast).
+    EngineConfig quickConfig() => EngineConfig(
+      heartbeatInterval: const Duration(milliseconds: 300),
+      normalInterval: const Duration(milliseconds: 200),
+      fastInterval: const Duration(milliseconds: 100),
+    );
+
+    late MockTransport transport;
+    late StreamController<Position> locationCtrl;
+    late RelayDriverEngine engine;
+
+    setUp(() {
+      transport = MockTransport();
+      locationCtrl = StreamController<Position>.broadcast();
+      engine = makeEngine(
+        transport: transport,
+        locationCtrl: locationCtrl,
+        config: quickConfig(),
+      );
+    });
+
+    tearDown(() async {
+      await engine.dispose();
+      await locationCtrl.close();
+    });
+
+    Iterable<Map<String, dynamic>> locationPayloads() =>
+        transport.sent.where((p) => !p.containsKey('event'));
+
+    test(
+      'an online driver keeps reaching the backend when fixes stop',
+      () async {
+        await engine.start();
+        await engine.setDriverStatus(DriverStatus.online);
+        locationCtrl.add(makePosition(lat: 6.5, lng: 3.4));
+        await Future.delayed(const Duration(milliseconds: 30));
+        expect(locationPayloads().length, 1);
+
+        // No fixes for over three heartbeat intervals.
+        await Future.delayed(const Duration(milliseconds: 1000));
+
+        final heartbeats = locationPayloads().skip(1).toList();
+        expect(heartbeats.length, greaterThanOrEqualTo(2));
+        for (final h in heartbeats) {
+          expect(h['isHeartbeat'], isTrue);
+          expect(h['lat'], closeTo(6.5, 1e-6));
+          expect(h['lng'], closeTo(3.4, 1e-6));
+          expect(h['driverStatus'], DriverStatus.online.value);
+        }
+      },
+    );
+
+    test('sends nothing before the first fix', () async {
+      await engine.start();
+      await engine.setDriverStatus(DriverStatus.online);
+      await Future.delayed(const Duration(milliseconds: 700));
+      expect(locationPayloads(), isEmpty);
+    });
+
+    test('stops when the driver goes offline', () async {
+      await engine.start();
+      await engine.setDriverStatus(DriverStatus.online);
+      locationCtrl.add(makePosition());
+      await Future.delayed(const Duration(milliseconds: 30));
+      await engine.setDriverStatus(DriverStatus.offline);
+      final sentAtOffline = locationPayloads().length;
+
+      await Future.delayed(const Duration(milliseconds: 800));
+      expect(locationPayloads().length, sentAtOffline);
+    });
+
+    test('does not add heartbeats while real fixes keep flowing', () async {
+      await engine.start();
+      await engine.setDriverStatus(DriverStatus.online);
+      for (var i = 0; i < 10; i++) {
+        locationCtrl.add(makePosition());
+        await Future.delayed(const Duration(milliseconds: 80));
+      }
+      // Fixes every 80 ms: the policy's own heartbeat paces emissions; the idle
+      // timer never needs to step in.
+      final payloads = locationPayloads().toList();
+      final gaps = <int>[];
+      for (var i = 1; i < payloads.length; i++) {
+        gaps.add((payloads[i]['ts'] as int) - (payloads[i - 1]['ts'] as int));
+      }
+      expect(gaps.every((g) => g >= 300), isTrue);
+    });
+  });
 }

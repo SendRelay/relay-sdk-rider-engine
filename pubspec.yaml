@@ -2,7 +2,7 @@ name: relay_driver_engine
 description: >
   Transport-agnostic Flutter driver location engine with adaptive emission,
   GPS smoothing, route snapping, and deviation detection for Relay riders.
-version: 0.3.0
+version: 0.4.0
 homepage: https://sendrelay.com.ng
 repository: https://github.com/SendRelay/relay-sdk-rider-engine.git
 

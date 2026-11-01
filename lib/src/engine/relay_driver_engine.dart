@@ -152,6 +152,15 @@ class RelayDriverEngine {
   StreamSubscription<Position>? _locationSub;
   StreamSubscription<bool>? _transportStateSub;
 
+  // The last update the backend accepted, and when. While the driver is online or
+  // busy, [_idleHeartbeat] re-sends it whenever nothing has gone out for a whole
+  // heartbeat interval, so a phone whose GPS stops producing fixes (indoors,
+  // stationary, OS throttling) never goes quiet while its network is up. Without it
+  // the backend would stop offering work while the app still shows "Online".
+  LocationUpdate? _lastSent;
+  DateTime? _lastSentAt;
+  Timer? _idleHeartbeat;
+
   DriverStatus _driverStatus = DriverStatus.offline;
   TaskStatus? _taskStatus;
   String? _taskId;
@@ -206,6 +215,8 @@ class RelayDriverEngine {
   Future<void> stop() async {
     if (!_running) return;
     _running = false;
+    _idleHeartbeat?.cancel();
+    _idleHeartbeat = null;
     await _locationSub?.cancel();
     _locationSub = null;
     await _transportStateSub?.cancel();
@@ -238,6 +249,8 @@ class RelayDriverEngine {
     if (status == DriverStatus.offline) {
       _kalman.reset();
       _policy.reset();
+      _lastSent = null;
+      _lastSentAt = null;
       try {
         await transport.send({
           'event': 'driver:offline',
@@ -317,6 +330,48 @@ class RelayDriverEngine {
       _locationSub = null;
       sub?.cancel().ignore();
     }
+    if (shouldRun && _idleHeartbeat == null) {
+      // Checked a few times per interval so a quiet stream is noticed promptly.
+      _idleHeartbeat = Timer.periodic(
+        config.heartbeatInterval ~/ 5,
+        (_) => _sendIdleHeartbeat(),
+      );
+    } else if (!shouldRun) {
+      _idleHeartbeat?.cancel();
+      _idleHeartbeat = null;
+    }
+  }
+
+  /// Re-sends the last accepted fix when the location stream has been quiet for a
+  /// whole heartbeat interval. The position is the driver's last known one; the
+  /// update is marked [LocationUpdate.isHeartbeat] and stamped with the send time.
+  void _sendIdleHeartbeat() {
+    final last = _lastSent;
+    final lastAt = _lastSentAt;
+    if (last == null || lastAt == null || !_driverStatus.shouldEmit) return;
+    final now = DateTime.now();
+    if (now.difference(lastAt) < config.heartbeatInterval) return;
+
+    final update = LocationUpdate(
+      lat: last.lat,
+      lng: last.lng,
+      rawLat: last.rawLat,
+      rawLng: last.rawLng,
+      heading: last.heading,
+      speed: 0,
+      accuracyMeters: last.accuracyMeters,
+      timestamp: now,
+      driverStatus: _driverStatus,
+      taskStatus: _taskStatus,
+      taskId: _taskId,
+      isSnapped: last.isSnapped,
+      deviationMeters: last.deviationMeters,
+      snappedSegmentIndex: last.snappedSegmentIndex,
+      isHeartbeat: true,
+    );
+    // Claim the slot before sending so overlapping checks cannot double-send.
+    _lastSentAt = now;
+    _transmit(update);
   }
 
   void _startLocationStream() {
@@ -445,18 +500,24 @@ class RelayDriverEngine {
       snappedSegmentIndex: snap.wasSnapped ? snap.segmentIndex : null,
     );
 
-    // Fire-and-forget send — errors surface via EngineError event.
-    // .ignore() explicitly marks the Future as intentionally not awaited,
-    // satisfying the unawaited_futures linter rule.
+    _transmit(update);
+  }
+
+  /// Sends [update] fire-and-forget; errors surface via [EngineError]. On success the
+  /// emission is recorded, so the policy and the idle heartbeat both measure from it.
+  /// `.ignore()` marks the Future as intentionally not awaited (unawaited_futures).
+  void _transmit(LocationUpdate update) {
     transport
         .send(update.toJson())
         .then((_) {
           _policy.recordEmission(
-            lat: snap.snapped.lat,
-            lng: snap.snapped.lng,
-            heading: normalizedHeading,
-            now: now,
+            lat: update.lat,
+            lng: update.lng,
+            heading: update.heading,
+            now: update.timestamp,
           );
+          _lastSent = update;
+          _lastSentAt = update.timestamp;
           _emit(LocationEmitted(update));
         })
         .catchError((Object e) {
